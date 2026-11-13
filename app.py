@@ -1,0 +1,248 @@
+"""Factory Decision Lab — Monte Carlo factory decision support."""
+from datetime import datetime, timezone
+import io
+import os
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from config import (SHEET_URL,PRODUCTS,MACHINES,RESOURCES,STAGE_RESOURCES,
+                    B_STATES,FMS_SHARES,DEFAULT_BETA,DEFAULT_MTTF_S,DEFAULT_REPAIR_S,DEFAULT_REPAIR_CV)
+from calibration import fetch_live,parse_data,calibrate,rolling_validation,most_recent_five
+from reliability import weibull_params
+from simulation import ensemble,summarize,mean_wip_curve
+
+st.set_page_config(page_title='Factory Decision Lab',page_icon='🏭',layout='wide',initial_sidebar_state='expanded')
+st.markdown('''<style>
+.block-container{padding-top:1.55rem;max-width:1450px}
+[data-testid="stMetric"]{border:1px solid #e2e8f0;border-radius:10px;padding:13px}
+[data-testid="stSidebar"] .stHeading{margin-top:0.6rem}
+</style>''',unsafe_allow_html=True)
+st.title('Factory Decision Lab')
+st.caption('Live product-wise calibration · Individual machine reliability · Discrete-event Monte Carlo simulation')
+
+if 'previous' not in st.session_state:st.session_state.previous=None
+if 'current' not in st.session_state:st.session_state.current=None
+
+with st.sidebar:
+    st.header('Simulation settings')
+    quantities={p:st.number_input(f'{p} quantity (products)',min_value=0,max_value=500,value=5,step=1,key=f'q_{p}') for p in PRODUCTS}
+    wip=st.number_input('Global WIP limit (products)',min_value=1,max_value=100,value=1,step=1)
+    runs=st.number_input('Monte Carlo replications (runs)',min_value=1,max_value=1000,value=100,step=10)
+    with st.expander('Buffers by machine (products)',expanded=False):
+        buffs={m:st.number_input(m,min_value=0,max_value=200,value=0,step=1,key=f'buf_{m}') for m in MACHINES}
+
+with st.expander('Machine reliability and repair settings',expanded=True):
+    st.subheader('Machine reliability and repair parameters')
+    mode=st.radio('Enter two parameters',options=['MTTF + β','η + β'],horizontal=True)
+    st.caption('Times entered in minutes; β has no units. Third parameter calculated automatically.')
+    first_label='MTTF (min)' if mode=='MTTF + β' else 'η (min)'
+    default_first=90.0 if mode=='MTTF + β' else 100.0
+    defaults=pd.DataFrame({'Machine':list(MACHINES),first_label:[default_first]*len(MACHINES),
+                           'β':[DEFAULT_BETA]*len(MACHINES),
+                           'Repair mean (min)':[DEFAULT_REPAIR_S/60]*len(MACHINES),
+                           'Repair CV':[DEFAULT_REPAIR_CV]*len(MACHINES)})
+    inputs=st.data_editor(defaults,hide_index=True,use_container_width=True,
+      disabled=['Machine'],key=f'weibull_editor_{mode}',num_rows='fixed',
+      column_config={first_label:st.column_config.NumberColumn(first_label,min_value=0.001,format='%.2f'),
+        'β':st.column_config.NumberColumn('β',min_value=0.05,format='%.3f'),
+        'Repair mean (min)':st.column_config.NumberColumn('Repair mean (min)',min_value=0.,format='%.2f'),
+        'Repair CV':st.column_config.NumberColumn('Repair CV',min_value=0.,format='%.3f')})
+    st.caption('Reliability applies only to MC1–MC9; manual workstations do not fail.')
+    seed=int(st.number_input('Random seed (advanced)',min_value=0,max_value=2_000_000_000,value=1313,step=1))
+
+
+go_run=st.button('Fetch live data & run Monte Carlo',type='primary')
+
+try:
+    reliability={}
+    for _,r in inputs.iterrows():
+        calc=weibull_params(mode,float(r[first_label])*60,float(r['β']))
+        reliability[r['Machine']]={**calc,'repair_s':float(r['Repair mean (min)'])*60,
+                                   'repair_cv':float(r['Repair CV'])}
+except (ValueError,OverflowError) as ex:
+    st.error(f'Invalid reliability settings: {ex}');st.stop()
+
+if go_run:
+    if not any(quantities.values()):
+        st.warning('Enter at least one product to simulate.')
+    else:
+        try:
+            with st.spinner('Fetching fresh production data from Google Sheets…'):
+                live,checksum=fetch_live()
+                latest,params,model=calibrate(live)
+                validation=rolling_validation(live)
+            with st.spinner(f'Running {runs:,} independent factory replications…'):
+                results=ensemble(model,quantities,wip,buffs,reliability,int(runs),seed)
+                summary=summarize(results)
+            snapshot={'df':live,'hash':checksum,'latest':latest,'params':params,
+                      'validation':validation,'results':results,'summary':summary,
+                      'runs':runs,'time':datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+                      'reliability':reliability,'quantities':quantities.copy(),
+                      'wip_limit':int(wip),'buffers':buffs.copy(),'seed':seed}
+            st.session_state.previous=st.session_state.current
+            st.session_state.current=snapshot
+            st.success(f'Fetched {len(live)} valid observations; {runs} simulation runs completed. Data version {checksum}.')
+        except Exception as ex:
+            st.error(f'Fresh-data simulation failed: {type(ex).__name__}: {ex}')
+            st.warning('No stale-data simulation was substituted. Check the published CSV link, data, and settings.')
+
+snap=st.session_state.current
+if snap is None:
+    st.info('Configure orders and reliability in the sidebar, then click **Run simulation**. Every run first fetches the latest published Google Sheet.')
+    st.caption('Live data source: '+SHEET_URL)
+    with st.expander('Modelling assumptions',expanded=False):
+        st.markdown('''- Processing: positive-truncated Normal for each product/resource, fitted from the latest five valid orders per product.
+- WS5–WS7: observed aggregate allocated using indicative historical stage shares; allocation is a model assumption.
+- Parallel resources: strict alternating assignments; jobs wait for their assigned machine.
+- Global WIP 1 means a single admitted product in the factory. Machine queue capacities default to zero.
+- Failures: Weibull operating-age; perfect lognormal repair; preempt-resume, no product loss.
+- WS8 is the final modelled workstation; its duration is taken from the sheet's WS8 column.
+- B6 Waiting for machine used for a resource holding a completed job unable to transfer downstream.
+- B7 Error/Alarm is a timestamped failure event, not fabricated elapsed duration.''')
+    st.stop()
+
+st.caption(f"Source: **published live Google Sheet** · Last successful fetch **{snap['time']}** · "
+           f"{len(snap['df'])} valid orders · Last chronological order **{snap['df'].iloc[-1]['order_id']}** · "
+           f"Data version `{snap['hash']}` · {snap['runs']} replications")
+
+tab_sim,tab_params,tab_validation=st.tabs(['Simulation results','Processing-time parameters','Live data & validation'])
+
+with tab_sim:
+    S=snap['summary']; R=snap['results']; n=snap['runs']
+    kpi=st.columns(5)
+    kpi[0].metric('Mean makespan',f"{S['mean_makespan_min']:.1f} min",f"P95: {S['p95_makespan_min']:.1f} min",delta_color='off')
+    kpi[1].metric('Mean throughput',f"{S['mean_throughput_h']:.2f} units/h")
+    kpi[2].metric('Completed / run',f"{np.mean([sum(r['completed'].values()) for r in R]):.1f} units")
+    kpi[3].metric('Mean failures',f"{S['mean_failures']:.2f} / run")
+    kpi[4].metric('Mean WIP',f"{S['mean_wip']:.2f} units",f"Limit: {snap['wip_limit']} units",delta_color='off')
+    if n==1:st.warning('One run is a trajectory, not a stable estimate of expected performance. Increase replications for decision-making.')
+    st.subheader('Production performance')
+    left,right=st.columns(2)
+    with left:
+        fig=go.Figure(go.Histogram(x=S['makespans'],nbinsx=min(35,max(1,int(np.sqrt(n)*2))),marker_color='#4468aa'))
+        fig.add_vline(x=S['mean_makespan_min'],line_dash='dash',annotation_text='Mean')
+        fig.add_vline(x=S['p95_makespan_min'],line_dash='dot',annotation_text='P95')
+        fig.update_layout(title='Makespan distribution',xaxis_title='Makespan (minutes)',yaxis_title='Monte Carlo runs (count)',height=350,margin=dict(l=30,r=20,t=45,b=30))
+        st.plotly_chart(fig,use_container_width=True)
+    with right:
+        f=S['failures_table']
+        fig=px.bar(f,x='Machine',y='Mean failures (count/run)',title='Expected breakdowns by machine',text_auto='.2f')
+        fig.update_layout(height=350,margin=dict(l=30,r=20,t=45,b=30))
+        st.plotly_chart(fig,use_container_width=True)
+    st.subheader('Resource operations — averages across all runs')
+    states=S['state_table']
+    busy=states.loc[states['State']=='B3'].copy()
+    busy['label']=[f"{x:.1f}% | {y:.1f} min" for x,y in zip(busy['Mean share (%)'],busy['Mean time (min)'])]
+    fig=px.bar(busy,x='Resource',y='Mean share (%)',text='label',
+                custom_data=['Mean time (min)'],title='Mean processing utilization')
+    fig.update_traces(textposition='outside',hovertemplate='%{x}<br>Processing: %{y:.2f}%<br>Mean time: %{customdata[0]:.2f} min/run<extra></extra>')
+    fig.update_yaxes(title_text='Processing time / run (%)',range=[0,max(115,busy['Mean share (%)'].max()+18)])
+    fig.update_layout(height=385,margin=dict(l=30,r=30,t=45,b=30))
+    st.plotly_chart(fig,use_container_width=True)
+    st.markdown('**Machine state-time composition** · horizontal position represents the mean fraction of a run. '
+                'Each segment also displays its mean **absolute duration (minutes/run)**.')
+    colors={'B1':'#9ca3af','B3':'#16856a','B5':'#c85b66','B6':'#d9a541'}
+    fig=go.Figure()
+    for state in ('B3','B1','B5','B6'):
+        sub=states[states['State']==state].set_index('Resource').reindex(RESOURCES)
+        pct=sub['Mean share (%)'].to_numpy();dur=sub['Mean time (min)'].to_numpy()
+        labels=[f'{p:.0f}% | {d:.1f}m' if p>=10 else '' for p,d in zip(pct,dur)]
+        fig.add_trace(go.Bar(name=f'{state} — {B_STATES[state]}',y=RESOURCES,x=pct,
+            orientation='h',marker_color=colors[state],text=labels,textposition='inside',
+            customdata=dur,hovertemplate='%{y}<br>%{fullData.name}<br>Mean fraction: %{x:.2f}%<br>Mean absolute: %{customdata:.2f} min/run<extra></extra>'))
+    fig.update_layout(barmode='stack',height=515,xaxis_title='Mean resource state share of run (%)',yaxis_title='Resource',
+      xaxis=dict(range=[0,100]),legend=dict(orientation='h',y=1.12),margin=dict(l=30,r=20,t=80,b=40))
+    st.plotly_chart(fig,use_container_width=True)
+    st.caption('Because each run has a different makespan, one universal minutes axis cannot exactly represent mean percentages. '
+               'Mean absolute durations are labelled in segments, tooltips, and the detailed table.')
+    st.subheader('Work in process')
+    wcurve=mean_wip_curve(R)
+    wfig=px.line(wcurve,x='Time (min)',y='Mean WIP (products)',title='Mean WIP by elapsed time')
+    wfig.update_layout(height=330,margin=dict(l=30,r=20,t=45,b=30))
+    st.plotly_chart(wfig,use_container_width=True)
+    st.caption('After a replication finishes, its WIP is treated as zero for the ensemble time-axis average.')
+    with st.expander('Resource statistics: mean time, percentages, failures, queues'):
+        pivot_pct=states.pivot(index='Resource',columns='State',values='Mean share (%)')
+        pivot_min=states.pivot(index='Resource',columns='State',values='Mean time (min)')
+        detail=[]
+        for m in RESOURCES:
+            row={'Resource':m}
+            for code in ('B1','B3','B5','B6'):
+                row[f'{B_STATES[code]} (%)']=pivot_pct.loc[m,code]
+                row[f'{B_STATES[code]} (min/run)']=pivot_min.loc[m,code]
+            row['Failures (count/run)']=float(np.mean([r['failures'].get(m,0) for r in R]))
+            row['Avg queue length (products)']=float(np.mean([r['queue_mean'].get(m,0) for r in R]))
+            row['Max queue length (products)']=max(r['queue_max'].get(m,0) for r in R)
+            row['Buffer cap (products)']=snap['buffers'].get(m,0)
+            detail.append(row)
+        st.dataframe(pd.DataFrame(detail).round(3),hide_index=True,use_container_width=True)
+        st.caption('Codes B2, B4 and B8 are defined in the source workbook but have no fabricated intervals in this simulator. B7 is logged as an alarm event.')
+    with st.expander('Product performance (all replications)'):
+        st.dataframe(S['product_table'].round(2),hide_index=True,use_container_width=True)
+    with st.expander('Diagnostic event log — replication 1 only (NOT an ensemble statistic)'):
+        st.caption('A chronological trace to audit engine behavior. This is not a mean trajectory.')
+        st.dataframe(pd.DataFrame(R[0]['event_log']),hide_index=True,use_container_width=True)
+    with st.expander('Model assumptions and limitations'):
+        st.markdown(f'''**Processing:** positive-truncated Normal; five most recent valid observations per product; product-specific μ and σ.  
+**Paired workstations:** strict independent alternation, starting at the lower-number machine; unavailable assigned machines are waited for.  
+**WS5–WS7 shares (assumed):** WS5 {FMS_SHARES['WS5']:.1%}, WS6 {FMS_SHARES['WS6']:.1%}, WS7 {FMS_SHARES['WS7']:.1%}. The three durations from one combined observation are correlated.  
+**Final workstation:** WS8, calibrated directly from the live sheet's WS8 column.  
+**Reliability:** usage-only aging, Weibull lifetime; failure triggers B7 alarm event, B5 repair duration; perfect repair, preempt-resume.  
+**Source state labels:** B1 Idle, B3 Processing, B5 Under maintenance, B6 Waiting for machine. B2 Setup, B4 Off, B8 Not applicable are not simulated as durations.  
+**WIP:** total admitted but unfinished units. **Buffer:** waiting places outside a machine's one active processing slot.  
+**Validation boundary:** rolling prediction errors validate estimated station duration, not independent machine-level failure timing or whole-factory empirical makespan.''')
+
+with tab_params:
+    st.subheader('Calculated Normal processing-time parameters')
+    st.caption('These are the exact μ and σ inputs used for this simulation, using the current live Sheet snapshot. '
+               'Each product contributes its latest five valid chronological observations.')
+    params=snap['params'].copy()
+    selected=st.multiselect('Filter products',PRODUCTS,default=list(PRODUCTS))
+    st.dataframe(params.loc[params['Product'].isin(selected)].round(4),hide_index=True,use_container_width=True,height=540)
+    st.download_button('Download parameter table (CSV)',params.to_csv(index=False).encode(),
+        file_name=f'processing_parameters_{snap["hash"]}.csv',mime='text/csv')
+    st.markdown('**Latest five observations selected for each product**')
+    view=snap['latest'][['order_id','product','date','WS1','WS2','WS3','WS4','WS5-7','WS8']].copy()
+    st.dataframe(view,hide_index=True,use_container_width=True)
+    st.markdown('**Current machine reliability parameters**')
+    rtab=pd.DataFrame([{'Machine':m,'MTTF (min)':v['mttf_s']/60,'η (min)':v['eta_s']/60,
+                          'β':v['beta'],'Repair mean (min)':v['repair_s']/60,
+                          'Repair CV':v['repair_cv']} for m,v in snap['reliability'].items()])
+    st.dataframe(rtab.round(3),hide_index=True,use_container_width=True)
+    prev=st.session_state.previous
+    if prev is not None:
+        st.markdown('**Change from previous simulation**')
+        curr=params.set_index(['Resource','Product'])[['Mean (s)','SD (s)']]
+        old=prev['params'].set_index(['Resource','Product'])[['Mean (s)','SD (s)']]
+        comparison=curr.join(old,lsuffix=' now',rsuffix=' before')
+        comparison['Δ mean (s)']=comparison['Mean (s) now']-comparison['Mean (s) before']
+        st.dataframe(comparison.reset_index().round(3),hide_index=True,use_container_width=True)
+        st.metric('Change in mean makespan',f"{S['mean_makespan_min']-prev['summary']['mean_makespan_min']:+.2f} min")
+        st.caption('Changes are causal comparisons only if machine settings, requested products, and random seeds were held fixed.')
+
+with tab_validation:
+    st.subheader('Live data and product-wise rolling validation')
+    st.markdown(f"**Source:** [Published Google Sheet]({SHEET_URL})")
+    st.caption(f"Fetched {snap['time']} · Version {snap['hash']} · {len(snap['df'])} valid historical records")
+    counts=snap['df'].groupby('product').size().reindex(PRODUCTS)
+    st.write('Historical observations by product:',', '.join(f'{p}: {int(counts[p])}' for p in PRODUCTS))
+    product=st.selectbox('Product to validate',PRODUCTS)
+    metric=st.selectbox('Observed duration column',['WS1','WS2','WS3','WS4','WS5-7','WS8'])
+    v=snap['validation']
+    subset=v[(v['Product']==product)&(v['Duration column']==metric)].copy()
+    mae=subset['Error (s)'].abs().mean();rmse=np.sqrt(np.mean(np.square(subset['Error (s)'])))
+    cc=st.columns(3);cc[0].metric('Rolling predictions',len(subset));cc[1].metric('MAE',f'{mae:.2f} s');cc[2].metric('RMSE',f'{rmse:.2f} s')
+    plot=subset.melt(id_vars=['Target observation'],value_vars=['Actual (s)','Predicted (s)'],var_name='Series',value_name='Duration (s)')
+    fig=px.line(plot,x='Target observation',y='Duration (s)',color='Series',markers=True,
+                title=f'{product} · {metric} · five-observation rolling forecast')
+    fig.update_layout(height=380,xaxis=dict(dtick=1),margin=dict(l=30,r=20,t=45,b=30))
+    st.plotly_chart(fig,use_container_width=True)
+    with st.expander('Individual rolling windows and prediction errors',expanded=True):
+        st.dataframe(subset.round(3),hide_index=True,use_container_width=True)
+    st.caption('Each prediction uses the preceding five observations of the SAME product, ordered by the Order ID timestamp. '
+               'Target observations are never included in their own training windows. '
+               'The 5–7 column is validated as the originally observed combined duration.')
+    with st.expander('Latest fetched raw observations'):
+        st.dataframe(snap['df'].drop(columns=['date']),hide_index=True,use_container_width=True)
